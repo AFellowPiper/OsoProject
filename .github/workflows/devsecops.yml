@@ -1,0 +1,241 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  DOCKER_IMAGE: your-dockerhub-username/juice-shop-secure
+  DOCKER_TAG: ${{ github.sha }}
+
+jobs:
+  # Etap 1: Budowanie i testy jednostkowe
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout kod
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        
+    - name: Instaluj zależności
+      run: npm ci
+      
+    - name: Uruchom testy jednostkowe
+      run: npm test
+      
+    - name: Build aplikacji
+      run: npm run build
+
+  # Etap 2: SCA - Skan zależności
+  sca-scan:
+    runs-on: ubuntu-latest
+    needs: build
+    
+    steps:
+    - name: Checkout kod
+      uses: actions/checkout@v4
+      
+    - name: OWASP Dependency Check
+      uses: dependency-check/Dependency-Check_Action@main
+      with:
+        project: 'juice-shop'
+        path: '.'
+        format: 'ALL'
+        
+    - name: Upload wyników Dependency Check
+      uses: actions/upload-artifact@v4
+      with:
+        name: dependency-check-report
+        path: reports/
+        
+    - name: npm audit
+      run: |
+        npm audit --audit-level=high --json > npm-audit.json || true
+        cat npm-audit.json
+        
+    - name: Upload npm audit results
+      uses: actions/upload-artifact@v4
+      with:
+        name: npm-audit-report
+        path: npm-audit.json
+
+  # Etap 3: SAST - Analiza kodu źródłowego
+  sast-scan:
+    runs-on: ubuntu-latest
+    needs: build
+    
+    steps:
+    - name: Checkout kod
+      uses: actions/checkout@v4
+      
+    - name: Semgrep SAST
+      uses: semgrep/semgrep-action@v1
+      with:
+        config: >-
+          p/security-audit
+          p/secrets
+          p/javascript
+          p/typescript
+        generateSarif: "1"
+        
+    - name: Upload wyników Semgrep
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: semgrep-report
+        path: semgrep.sarif
+
+  # Etap 4: Secrets Scan
+  secrets-scan:
+    runs-on: ubuntu-latest
+    needs: build
+    
+    steps:
+    - name: Checkout kod
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        
+    - name: Gitleaks Scan
+      uses: gitleaks/gitleaks-action@v2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  # Etap 5: Budowanie obrazu Docker
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: [sca-scan, sast-scan, secrets-scan]
+    
+    steps:
+    - name: Checkout kod
+      uses: actions/checkout@v4
+      
+    - name: Login do Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+        
+    - name: Build Docker image
+      run: |
+        docker build -t ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }} .
+        docker build -t ${{ env.DOCKER_IMAGE }}:latest .
+
+  # Etap 6: Skan obrazu Docker
+  docker-scan:
+    runs-on: ubuntu-latest
+    needs: docker-build
+    
+    steps:
+    - name: Checkout kod
+      uses: actions/checkout@v4
+      
+    - name: Login do Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+        
+    - name: Build obrazu do skanowania
+      run: docker build -t ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }} .
+      
+    - name: Trivy skan obrazu
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        severity: 'CRITICAL,HIGH'
+        
+    - name: Upload wyników Trivy
+      uses: actions/upload-artifact@v4
+      with:
+        name: trivy-report
+        path: trivy-results.sarif
+
+  # Etap 7: DAST - Tymczasowy deployment i skanowanie
+  dast-scan:
+    runs-on: ubuntu-latest
+    needs: docker-build
+    
+    services:
+      docker:
+        image: docker:dind
+        options: --privileged
+        
+    steps:
+    - name: Checkout kod
+      uses: actions/checkout@v4
+      
+    - name: Login do Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+        
+    - name: Build i uruchom aplikację
+      run: |
+        docker build -t juice-shop-test .
+        docker run -d -p 3000:3000 --name juice-shop-container juice-shop-test
+        sleep 30  # Czekaj na uruchomienie aplikacji
+        
+    - name: Sprawdź czy aplikacja działa
+      run: |
+        curl -f http://localhost:3000 || (docker logs juice-shop-container && exit 1)
+        
+    - name: OWASP ZAP Baseline Scan
+      uses: zaproxy/action-baseline@v0.12.0
+      with:
+        target: 'http://localhost:3000'
+        rules_file_name: '.zap/rules.tsv'
+        cmd_options: '-a -j -m 10 -T 60 -z "-configFile /zap/wrk/.zap/options.prop"'
+        
+    - name: Stop kontener testowy
+      if: always()
+      run: |
+        docker stop juice-shop-container || true
+        docker rm juice-shop-container || true
+
+  # Etap 8: Push obrazu Docker
+  docker-push:
+    runs-on: ubuntu-latest
+    needs: [docker-scan, dast-scan]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout kod
+      uses: actions/checkout@v4
+      
+    - name: Login do Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+        
+    - name: Build i push obrazu
+      run: |
+        docker build -t ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }} .
+        docker build -t ${{ env.DOCKER_IMAGE }}:latest .
+        docker push ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}
+        docker push ${{ env.DOCKER_IMAGE }}:latest
+
+  # Etap 9: Opcjonalny deployment
+  deploy:
+    runs-on: ubuntu-latest
+    needs: docker-push
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Deploy to production
+      run: |
+        echo "Deployment placeholder - skonfiguruj według potrzeb"
+        echo "Image: ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}"
